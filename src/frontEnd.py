@@ -35,6 +35,7 @@ with gr.Blocks(title="RFP Generator") as demo:
                     info="Select one or more questions to explore"
                 )
                 explore_btn = gr.Button("🔍 Explore Selected Questions", variant="primary", size="lg")
+                explore_loading_bar = gr.HTML()
                 explore_output = gr.Markdown()
             
             def extract_questions_from_pdf(pdf_file_path):
@@ -97,17 +98,22 @@ with gr.Blocks(title="RFP Generator") as demo:
             def handle_explore_click(selected_questions_list):
                 """Handle the explore button click - pass selected question strings directly to interactive_query."""
                 if not selected_questions_list:
-                    return "⚠️ Please select at least one question to explore."
+                    yield "", "⚠️ Please select at least one question to explore."
+                    return
                 
-                # selected_questions_list is already a list of question strings from the CheckboxGroup
-                """
+                # Show loading bar
+                loading_html = (
+                    "<div style='padding:8px 0'>Exploring questions...<div style='height:10px;background:#eee;border-radius:6px;overflow:hidden;margin-top:8px;'>"
+                    "<div style='width:30%;height:100%;background:linear-gradient(90deg,#3b82f6,#60a5fa);animation:progress 1.2s linear infinite;'></div></div></div>"
+                    "<style>@keyframes progress{0%{transform:translateX(-200%)}100%{transform:translateX(200%)}}</style>"
+                )
+                yield loading_html, ""
+                
                 try:
-                    # Create a simple doc_registry (you may want to pass this from the PDF extraction)
-                    doc_registry = {}
-                    
                     # Run the async function with the question strings directly
-                     results = asyncio.run(interactive_query(selected_questions_list, doc_registry))
+                    results = asyncio.run(interactive_query(selected_questions_list))
                     
+                    print(results)
                     # Format results for display
                     output = "## Exploration Results\n\n"
                     for result in results:
@@ -128,15 +134,15 @@ with gr.Blocks(title="RFP Generator") as demo:
                         
                         output += "\n---\n"
                     
-                    return output
+                    yield "", output
                 except Exception as e:
-                    return f"❌ Error during exploration: {str(e)}" 
-                    """
+                    yield "", f"❌ Error during exploration: {str(e)}" 
+                    
             
             explore_btn.click(
                 handle_explore_click,
                 inputs=[selected_questions],
-                outputs=[explore_output]
+                outputs=[explore_loading_bar, explore_output]
             )
 
 if __name__ == "__main__":
