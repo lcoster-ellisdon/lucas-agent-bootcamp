@@ -1,7 +1,7 @@
 import os
 import numpy as np
+import requests
 from collections import defaultdict
-import openai
 
 
 # ============================================================
@@ -11,19 +11,12 @@ import openai
 class EmbeddingClient:
     def __init__(
         self,
-        embedding_model_name="text-embedding-3-small",
-        embedding_api_key=None,
-        embedding_base_url=None,
+        embedding_model_name="@cf/baai/bge-small-en-v1.5",
     ):
         self.embedding_model_name = embedding_model_name
-        self.embedding_api_key = embedding_api_key
-        self.embedding_base_url = embedding_base_url
-
-        self._embed_client = openai.OpenAI(
-            api_key=self.embedding_api_key or os.getenv("EMBEDDING_API_KEY"),
-            base_url=self.embedding_base_url or os.getenv("EMBEDDING_BASE_URL"),
-            max_retries=5,
-        )
+        self.account_id = os.environ.get("CLOUDFLARE_ACCOUNT_ID")
+        self.auth_token =os.environ.get("EMBEDDING_API_KEY")
+        self.base_url = f"https://api.cloudflare.com/client/v4/accounts/{self.account_id}/ai/run"
 
     def embed_texts(self, texts):
         """
@@ -31,12 +24,15 @@ class EmbeddingClient:
         Returns:
             np.ndarray shape (N, dim), L2-normalized
         """
-        response = self._embed_client.embeddings.create(
-            input=texts,
-            model=self.embedding_model_name,
+        response = requests.post(
+            f"{self.base_url}/{self.embedding_model_name}",
+            headers={"Authorization": f"Bearer {self.auth_token}"},
+            json={"text": texts}
         )
+        response.raise_for_status()
+        data = response.json()
 
-        vectors = np.array([d.embedding for d in response.data])
+        vectors = np.array(data["result"]["data"])
 
         # L2 normalize so cosine similarity = dot product
         norms = np.linalg.norm(vectors, axis=1, keepdims=True)
