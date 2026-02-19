@@ -8,22 +8,10 @@ from gradio.components.chatbot import ChatMessage
 from langfuse import propagate_attributes
 import os
 import pandas as pd
+import openai
 
-from src.utils import (
-    oai_agent_stream_to_gradio_messages,
-    set_up_logging,
-    setup_langfuse_tracer,
-)
-from src.utils.agent_session import get_or_create_session
-from src.utils.client_manager import AsyncClientManager
-from src.utils.gradio import COMMON_GRADIO_CONFIG
-from src.utils.langfuse.shared_client import langfuse_client
-from src.utils.tools.gemini_grounding import (
-    GeminiGroundingWithGoogleSearch,
-    ModelSettings,
-)
-from docScore import bert_doc_score
 from pageindex import PageIndexClient
+import pageindex.utils as utils
 
 pi_client = PageIndexClient(api_key=os.getenv("PAGEINDEX_API_KEY"))
 
@@ -52,21 +40,23 @@ def query_pageindex(query: str, doc_id: str = None):
 
 
 import json
-from doc_score import EmbeddingClient, top_k_sources_for_question  # adjust import path as needed
+from docScore import EmbeddingClient, top_k_sources_for_question  # adjust import path as needed
 
 async def interactive_query(
     questions,
-    hf_dataset,
+    
     top_k: int = 3,
-    answers_per_doc: int | None = None,
+    answers_per_doc: int | None = 1,
     datasets_root: str = "/datasets",
     ensure_pdf_ext: bool = True,
-    pageindex_api_key: str | None = None,
+    pageindex_api_key: str | None = os.getenv("PAGEINDEX_API_KEY"),
     # --- embedder config ---
-    embedding_model_name: str = "text-embedding-3-small",
-    embedding_api_key: str | None = None,
-    embedding_base_url: str | None = None,
+    embedding_model_name: str = "bge-small-en-v1.5",
+    embedding_api_key: str | None = os.getenv("EMBEDDING_API_KEY"),
+    embedding_base_url: str | None = os.getenv("EMBEDDING_BASE_URL"),
 ):
+    hf_dataset = pd.read_parquet("hf://datasets/Vaibhav42/ellisdonone/data/train-00000-of-00001.parquet")
+
     """
     For each question:
       1) Use HF dataset chunks + OpenAI embeddings (via EmbeddingClient) to pick top_k files
@@ -96,9 +86,7 @@ async def interactive_query(
 
     # ---- initialize embedder once ----
     embedder = EmbeddingClient(
-        embedding_model_name=embedding_model_name,
-        embedding_api_key=embedding_api_key,
-        embedding_base_url=embedding_base_url,
+    
     )
 
     # ---- PageIndex client ----
@@ -110,9 +98,7 @@ async def interactive_query(
             file_name += ".pdf"
         return f"{datasets_root.rstrip('/')}/{file_name}"
 
-    async def _pageindex_retrieve_sources(pdf_path: str, query_text: str):
-        submitted = pi_client.submit_document(pdf_path)
-        pi_doc_id = submitted["doc_id"]
+    async def _pageindex_retrieve_sources(pi_doc_id: str, query_text: str):
 
         if not pi_client.is_retrieval_ready(pi_doc_id):
             return [], "Document not ready for retrieval"
@@ -188,6 +174,12 @@ Provide a clear, concise answer based only on the context provided.
         return out
 
     all_out = []
+    linking_dataset = pd.read_csv("uploaded_documents.csv")  # expects columns: filename, doc_id
+
+    # Create a fast lookup dictionary: filename -> doc_id
+    filename_to_docid = dict(
+        zip(linking_dataset["file_name"], linking_dataset["doc_id"])
+    )
 
     for q in questions:
         # 1) Rank top_k files using embedder-backed scoring
@@ -196,13 +188,26 @@ Provide a clear, concise answer based only on the context provided.
         # 2) PageIndex each top file
         responses = []
         for file_name in top_files:
-            pdf_path = _pdf_path(file_name)
+            # 🔹 Get doc_id from linking dataset
+            doc_id = filename_to_docid.get(file_name)
 
-            sources, err = await _pageindex_retrieve_sources(pdf_path, q)
+            if doc_id is None:
+                responses.append({
+                    "file": file_name,
+                    "doc_id": None,
+                    "answer": None,
+                    "sources": [],
+                    "error": f"doc_id not found for filename: {file_name}"
+                })
+                continue
+
+            # 🔹 Call PageIndex using doc_id
+            sources, err = await _pageindex_retrieve_sources(doc_id, q)
+
             if err:
                 responses.append({
                     "file": file_name,
-                    "pdf_path": pdf_path,
+                    "doc_id": doc_id,
                     "answer": None,
                     "sources": [],
                     "error": err
@@ -213,7 +218,7 @@ Provide a clear, concise answer based only on the context provided.
                 answer = await _answer_from_sources(q, sources)
                 responses.append({
                     "file": file_name,
-                    "pdf_path": pdf_path,
+                    "doc_id": doc_id,
                     "answer": answer,
                     "sources": sources
                 })
@@ -222,9 +227,9 @@ Provide a clear, concise answer based only on the context provided.
                 for item in node_answers:
                     responses.append({
                         "file": file_name,
-                        "pdf_path": pdf_path,
+                        "doc_id": doc_id,
                         "answer": item["answer"],
-                        "sources": item["sources"]
+                        "sources": item["sources"]  # single-page citation
                     })
 
         all_out.append({
@@ -252,4 +257,3 @@ async def call_llm(prompt, model="gpt-4.1", temperature=0):
         temperature=temperature
     )
     return response.choices[0].message.content.strip()
-
