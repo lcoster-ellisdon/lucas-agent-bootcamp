@@ -52,6 +52,7 @@ def query_pageindex(query: str, doc_id: str = None):
 
 
 import json
+from doc_score import EmbeddingClient, top_k_sources_for_question  # adjust import path as needed
 
 async def interactive_query(
     questions,
@@ -61,12 +62,16 @@ async def interactive_query(
     datasets_root: str = "/datasets",
     ensure_pdf_ext: bool = True,
     pageindex_api_key: str | None = None,
+    # --- embedder config ---
+    embedding_model_name: str = "text-embedding-3-small",
+    embedding_api_key: str | None = None,
+    embedding_base_url: str | None = None,
 ):
     """
     For each question:
-      1) Rank sources (filenames) using HF dataset chunks (top_k)
+      1) Use HF dataset chunks + OpenAI embeddings (via EmbeddingClient) to pick top_k files
       2) Call PageIndex on each top file
-      3) Return relevant answers + page sources
+      3) Return answers + page sources
 
     Returns:
       [
@@ -80,17 +85,23 @@ async def interactive_query(
               "answer": "...",
               "sources": [{"page": 5, "node_id": "...", "title": "...", "text": "..."}],
               "error": "..." (optional)
-            },
-            ...
+            }, ...
           ]
-        },
-        ...
+        }, ...
       ]
     """
 
     if not isinstance(questions, (list, tuple)):
         raise TypeError("questions must be a list[str]")
 
+    # ---- initialize embedder once ----
+    embedder = EmbeddingClient(
+        embedding_model_name=embedding_model_name,
+        embedding_api_key=embedding_api_key,
+        embedding_base_url=embedding_base_url,
+    )
+
+    # ---- PageIndex client ----
     pi_client = PageIndexClient(api_key=pageindex_api_key or PAGEINDEX_API_KEY)
 
     def _pdf_path(file_name: str) -> str:
@@ -100,9 +111,6 @@ async def interactive_query(
         return f"{datasets_root.rstrip('/')}/{file_name}"
 
     async def _pageindex_retrieve_sources(pdf_path: str, query_text: str):
-        """
-        Returns list of sources with page/node/title/text for nodes relevant to query_text.
-        """
         submitted = pi_client.submit_document(pdf_path)
         pi_doc_id = submitted["doc_id"]
 
@@ -162,9 +170,6 @@ Provide a clear, concise answer based only on the context provided.
         return await call_llm(answer_prompt)
 
     async def _answer_per_source_node(query_text: str, sources: list[dict], limit: int) -> list[dict]:
-        """
-        Multiple answers per doc: one per node (each answer has a single page source).
-        """
         out = []
         for s in sources[:limit]:
             node_context = s.get("text", "")
@@ -179,14 +184,14 @@ Context:
 Provide a clear, concise answer based only on the context provided.
 """
             ans = await call_llm(answer_prompt)
-            out.append({"answer": ans, "sources": [s]})
+            out.append({"answer": ans, "sources": [s]})  # single page source
         return out
 
     all_out = []
 
     for q in questions:
-        # 1) Rank top_k files using your dataset scorer (returns ONLY names)
-        top_files = top_k_sources_for_question(hf_dataset, q, k=top_k)
+        # 1) Rank top_k files using embedder-backed scoring
+        top_files = top_k_sources_for_question(hf_dataset, q, embedder, k=top_k)
 
         # 2) PageIndex each top file
         responses = []
@@ -219,7 +224,7 @@ Provide a clear, concise answer based only on the context provided.
                         "file": file_name,
                         "pdf_path": pdf_path,
                         "answer": item["answer"],
-                        "sources": item["sources"]  # single-page citation
+                        "sources": item["sources"]
                     })
 
         all_out.append({
