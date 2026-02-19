@@ -1,149 +1,137 @@
-import tensorflow as tf
+import os
 import numpy as np
-from transformers import BertTokenizer, TFBertModel
 from collections import defaultdict
+import openai
 
 
 # ============================================================
-# 1. Load HuggingFace BERT Model + Tokenizer
+# 1. Embedding Client Setup
 # ============================================================
 
-MODEL_NAME = "bert-base-uncased"
+class EmbeddingClient:
+    def __init__(
+        self,
+        embedding_model_name="text-embedding-3-small",
+        embedding_api_key=None,
+        embedding_base_url=None,
+    ):
+        self.embedding_model_name = embedding_model_name
+        self.embedding_api_key = embedding_api_key
+        self.embedding_base_url = embedding_base_url
 
-tokenizer = BertTokenizer.from_pretrained(MODEL_NAME)
-bert_model = TFBertModel.from_pretrained(MODEL_NAME)
+        self._embed_client = openai.OpenAI(
+            api_key=self.embedding_api_key or os.getenv("EMBEDDING_API_KEY"),
+            base_url=self.embedding_base_url or os.getenv("EMBEDDING_BASE_URL"),
+            max_retries=5,
+        )
+
+    def embed_texts(self, texts):
+        """
+        texts: list[str]
+        Returns:
+            np.ndarray shape (N, dim), L2-normalized
+        """
+        response = self._embed_client.embeddings.create(
+            input=texts,
+            model=self.embedding_model_name,
+        )
+
+        vectors = np.array([d.embedding for d in response.data])
+
+        # L2 normalize so cosine similarity = dot product
+        norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+        vectors = vectors / np.clip(norms, 1e-10, None)
+
+        return vectors
 
 
 # ============================================================
-# 2. Embedding Function
+# 2. Chunk Scoring
 # ============================================================
 
-def embed_texts(texts, max_length=256):
+def chunk_scores_from_qemb(q_emb, chunk_texts, embedder):
     """
-    Convert list[str] -> normalized BERT embeddings (CLS pooled).
-
-    Returns:
-        tf.Tensor shape (N, hidden_dim)
-    """
-
-    encoded = tokenizer(
-        texts,
-        padding=True,
-        truncation=True,
-        max_length=max_length,
-        return_tensors="tf"
-    )
-
-    outputs = bert_model(**encoded)
-
-    # CLS token embedding: (N, hidden_dim)
-    cls_embeddings = outputs.last_hidden_state[:, 0, :]
-
-    # Normalize so cosine similarity = dot product
-    normed = tf.math.l2_normalize(cls_embeddings, axis=1)
-
-    return normed
-
-
-# ============================================================
-# 3. Chunk Scoring
-# ============================================================
-
-def chunk_scores_from_qemb(q_emb, chunk_texts):
-    """
-    Compute cosine similarity between query embedding and each chunk embedding.
-
-    q_emb: shape (1, hidden)
+    q_emb: np.ndarray shape (1, dim)
     chunk_texts: list[str]
+    embedder: EmbeddingClient instance
 
     Returns:
-        list[float] similarity scores
+        list[float]
     """
-
     if not chunk_texts:
         return []
 
-    c_embs = embed_texts(chunk_texts)
+    c_embs = embedder.embed_texts(chunk_texts)  # (N, dim)
 
-    sims = tf.squeeze(tf.matmul(c_embs, q_emb, transpose_b=True), axis=1)
+    sims = np.dot(c_embs, q_emb.T).squeeze(1)  # cosine similarity
 
-    return sims.numpy().tolist()
+    return sims.tolist()
 
 
 # ============================================================
-# 4. Doc Score Aggregation
+# 3. Doc Score Aggregation
 # ============================================================
 
 def doc_score_from_chunks(chunk_scores_list):
     """
     DocScore = (1/sqrt(N+1)) * sum(chunk_scores)
-
-    N = number of chunks
     """
-
     N = len(chunk_scores_list)
     if N == 0:
         return float("-inf")
-
-    return (1.0 / ((N + 1) ** 0.5)) * sum(chunk_scores_list)
+    return (1.0 / ((N + 1) ** 0.5)) * float(np.sum(chunk_scores_list))
 
 
 # ============================================================
-# 5. Document Scoring
+# 4. Document Scoring
 # ============================================================
 
-def bert_doc_score(query_text, chunk_texts, q_emb=None):
+def bert_doc_score(query_text, chunk_texts, embedder, q_emb=None):
     """
-    Compute document score for one doc.
-
     query_text: str
     chunk_texts: list[str]
+    embedder: EmbeddingClient
     q_emb: optional precomputed query embedding
 
     Returns:
-        float doc score
+        float
     """
-
     if q_emb is None:
-        q_emb = embed_texts([query_text])
+        q_emb = embedder.embed_texts([query_text])  # (1, dim)
 
-    chunk_sims = chunk_scores_from_qemb(q_emb, chunk_texts)
+    chunk_sims = chunk_scores_from_qemb(q_emb, chunk_texts, embedder)
 
     return doc_score_from_chunks(chunk_sims)
 
 
 # ============================================================
-# 6. Rank Sources in HuggingFace Dataset
+# 5. Rank Sources in HuggingFace Dataset
 # ============================================================
 
-def top_k_sources_for_question(hf_dataset, query_text, k=3):
+def top_k_sources_for_question(hf_dataset, query_text, embedder, k=3):
     """
-    hf_dataset: HuggingFace Dataset with columns:
-        - source (file name)
-        - text   (chunk)
+    hf_dataset: HuggingFace Dataset with:
+        - source
+        - text
 
     Returns:
         list[str] top-k file names only
     """
 
-    # --- Group chunks by source ---
     grouped = defaultdict(list)
 
     for src, txt in zip(hf_dataset["source"], hf_dataset["text"]):
         if txt:
             grouped[str(src)].append(str(txt))
 
-    # --- Embed query once ---
-    q_emb = embed_texts([query_text])
+    # Embed query once
+    q_emb = embedder.embed_texts([query_text])  # (1, dim)
 
-    # --- Score each document ---
     scored = []
     for src, chunk_texts in grouped.items():
-        score = bert_doc_score(query_text, chunk_texts, q_emb=q_emb)
+        score = bert_doc_score(query_text, chunk_texts, embedder, q_emb=q_emb)
         scored.append((src, score))
 
-    # --- Sort descending ---
     scored.sort(key=lambda x: x[1], reverse=True)
 
-    # --- Return only names ---
     return [src for src, _ in scored[:k]]
