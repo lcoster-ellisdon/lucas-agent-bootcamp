@@ -119,8 +119,8 @@ with gr.Blocks(title="RFP Generator") as demo:
                     for result in results:
                         output += f"### Question: {result['question']}\n"
                         output += f"**Top Documents:**\n"
-                        for doc in result['top_files'][:3]:
-                            output += f"- {doc}\n"
+                        for doc in result['ranked_docs'][:3]:
+                            output += f"- Doc: {doc['doc_id']} (Score: {doc['score']:.3f})\n"
                         
                         if result['responses']:
                             output += f"\n**Answers:**\n"
