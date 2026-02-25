@@ -1,13 +1,15 @@
 import os
 import csv
+from dotenv import load_dotenv
 from pageindex import PageIndexClient
 import pageindex.utils as utils
+load_dotenv()
 
 # ==============================
 # Configuration
 # ==============================
 
-PAGEINDEX_API_KEY = "e16fabe60d794db29676c1d9f2cb9710"
+PAGEINDEX_API_KEY = os.getenv("PAGEINDEX_API_KEY")
 DATASET_FOLDER = "../../datasets"   # folder where your files are stored
 OUTPUT_CSV = "uploaded_documents.csv"
 
@@ -15,7 +17,6 @@ OUTPUT_CSV = "uploaded_documents.csv"
 # Initialize PageIndex Client
 # ==============================
 
-print(PAGEINDEX_API_KEY)
 pi_client = PageIndexClient(api_key=PAGEINDEX_API_KEY)
 
 # ==============================
