@@ -14,8 +14,12 @@ class EmbeddingClient:
         embedding_model_name="@cf/baai/bge-small-en-v1.5",
     ):
         self.embedding_model_name = embedding_model_name
-        self.account_id = os.environ.get("CLOUDFLARE_ACCOUNT_ID")
-        self.auth_token =os.environ.get("EMBEDDING_API_KEY")
+        self.account_id = os.getenv("CLOUDFLARE_ACCOUNT_ID")
+        self.auth_token = os.getenv("EMBEDDING_API_KEY")
+        if not self.account_id:
+            raise ValueError("CLOUDFLARE_ACCOUNT_ID environment variable not set")
+        if not self.auth_token:
+            raise ValueError("EMBEDDING_API_KEY environment variable not set")
         self.base_url = f"https://api.cloudflare.com/client/v4/accounts/{self.account_id}/ai/run"
 
     def embed_texts(self, texts):
