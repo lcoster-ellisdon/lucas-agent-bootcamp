@@ -8,7 +8,10 @@ from gradio.components.chatbot import ChatMessage
 from langfuse import propagate_attributes
 import os
 import pandas as pd
-import openai
+from openai import AsyncOpenAI
+
+# Load environment variables
+load_dotenv()
 
 from pageindex import PageIndexClient
 import pageindex.utils as utils
@@ -40,57 +43,39 @@ def query_pageindex(query: str, doc_id: str = None):
 
 
 import json
-from docScore import EmbeddingClient, top_k_sources_for_question  # adjust import path as needed
+import os
+import pandas as pd
+from docScore import EmbeddingClient, top_k_sources_for_question
 
 async def interactive_query(
     questions,
-    
-    top_k: int = 3,
+    top_k: int = 1,
     answers_per_doc: int | None = 1,
     datasets_root: str = "/datasets",
     ensure_pdf_ext: bool = True,
     pageindex_api_key: str | None = os.getenv("PAGEINDEX_API_KEY"),
-    # --- embedder config ---
-    embedding_model_name: str = "bge-small-en-v1.5",
-    embedding_api_key: str | None = os.getenv("EMBEDDING_API_KEY"),
-    embedding_base_url: str | None = os.getenv("EMBEDDING_BASE_URL"),
+    embedding_model_name: str = "@cf/baai/bge-small-en-v1.5",
 ):
     hf_dataset = pd.read_parquet("hf://datasets/Vaibhav42/ellisdonone/data/train-00000-of-00001.parquet")
+    filterOn = pd.read_csv("uploaded_documents.csv")
+    hf_dataset = hf_dataset[hf_dataset["source"].isin(filterOn["file_name"])]
 
-    """
-    For each question:
-      1) Use HF dataset chunks + OpenAI embeddings (via EmbeddingClient) to pick top_k files
-      2) Call PageIndex on each top file
-      3) Return answers + page sources
-
-    Returns:
-      [
-        {
-          "question": "...",
-          "top_files": ["a.pdf","b.pdf","c.pdf"],
-          "responses": [
-            {
-              "file": "a.pdf",
-              "pdf_path": "/datasets/a.pdf",
-              "answer": "...",
-              "sources": [{"page": 5, "node_id": "...", "title": "...", "text": "..."}],
-              "error": "..." (optional)
-            }, ...
-          ]
-        }, ...
-      ]
-    """
 
     if not isinstance(questions, (list, tuple)):
         raise TypeError("questions must be a list[str]")
 
+    # Debug: Print environment variables
+    print("\n=== DEBUG: Environment Variables ===")
+    print(f"CLOUDFLARE_ACCOUNT_ID: {os.getenv('CLOUDFLARE_ACCOUNT_ID')}")
+    print(f"EMBEDDING_API_KEY loaded: {'Yes' if os.getenv('EMBEDDING_API_KEY') else 'No'}")
+    print(f"PAGEINDEX_API_KEY loaded: {'Yes' if os.getenv('PAGEINDEX_API_KEY') else 'No'}")
+    print("===================================\n")
+
     # ---- initialize embedder once ----
-    embedder = EmbeddingClient(
-    
-    )
+    embedder = EmbeddingClient(embedding_model_name=embedding_model_name)
 
     # ---- PageIndex client ----
-    pi_client = PageIndexClient(api_key=pageindex_api_key or PAGEINDEX_API_KEY)
+    pi_client = PageIndexClient(api_key=pageindex_api_key or os.getenv("PAGEINDEX_API_KEY"))
 
     def _pdf_path(file_name: str) -> str:
         file_name = str(file_name)
@@ -99,47 +84,31 @@ async def interactive_query(
         return f"{datasets_root.rstrip('/')}/{file_name}"
 
     async def _pageindex_retrieve_sources(pi_doc_id: str, query_text: str):
-
         if not pi_client.is_retrieval_ready(pi_doc_id):
             return [], "Document not ready for retrieval"
 
-        tree = pi_client.get_tree(pi_doc_id, node_summary=True)["result"]
-        node_map = utils.create_node_mapping(tree)
-        tree_without_text = utils.remove_fields(tree.copy(), fields=["text"])
+        try:
+            # Use PageIndex native retrieval API instead of manual tree traversal + LLM
+            results = pi_client.chat_completions(
+                messages=[{"role": "user", "content":query_text}],
+                doc_id=pi_doc_id
+            )
+           
+            sources = []
+            for node in results.get("result", []):
+                sources.append({
+                    "page": node.get("page_index"),
+                    "node_id": node.get("node_id"),
+                    "title": node.get("title"),
+                    "text": node.get("text", "")
+                })
 
-        search_prompt = f"""
-You are given a question and a tree structure of a document.
-Each node contains a node id, node title, and a corresponding summary.
-Your task is to find all nodes that are likely to contain the answer to the question.
+            sources.sort(key=lambda s: (s["page"] is None, s["page"]))
+            print(results["choices"][0]["message"]["content"])
+            return sources, None
 
-Question: {query_text}
-
-Document tree structure:
-{json.dumps(tree_without_text, indent=2)}
-
-Please reply in the following JSON format:
-{{
-  "node_list": ["node_id_1", "node_id_2", "..."]
-}}
-Directly return the final JSON structure. Do not output anything else.
-"""
-        tree_search_result = await call_llm(search_prompt)
-        node_list = json.loads(tree_search_result).get("node_list", [])
-
-        sources = []
-        for node_id in node_list:
-            node = node_map.get(node_id)
-            if not node:
-                continue
-            sources.append({
-                "page": node.get("page_index"),
-                "node_id": node.get("node_id"),
-                "title": node.get("title"),
-                "text": node.get("text", "")
-            })
-
-        sources.sort(key=lambda s: (s["page"] is None, s["page"]))
-        return sources, None
+        except Exception as e:
+            return [], str(e)
 
     async def _answer_from_sources(query_text: str, sources: list[dict]) -> str:
         context = "\n\n".join(s["text"] for s in sources if s.get("text"))
@@ -170,13 +139,12 @@ Context:
 Provide a clear, concise answer based only on the context provided.
 """
             ans = await call_llm(answer_prompt)
-            out.append({"answer": ans, "sources": [s]})  # single page source
+            out.append({"answer": ans, "sources": [s]})
         return out
 
     all_out = []
-    linking_dataset = pd.read_csv("uploaded_documents.csv")  # expects columns: filename, doc_id
+    linking_dataset = pd.read_csv("uploaded_documents.csv")
 
-    # Create a fast lookup dictionary: filename -> doc_id
     filename_to_docid = dict(
         zip(linking_dataset["file_name"], linking_dataset["doc_id"])
     )
@@ -188,7 +156,6 @@ Provide a clear, concise answer based only on the context provided.
         # 2) PageIndex each top file
         responses = []
         for file_name in top_files:
-            # 🔹 Get doc_id from linking dataset
             doc_id = filename_to_docid.get(file_name)
 
             if doc_id is None:
@@ -201,7 +168,6 @@ Provide a clear, concise answer based only on the context provided.
                 })
                 continue
 
-            # 🔹 Call PageIndex using doc_id
             sources, err = await _pageindex_retrieve_sources(doc_id, q)
 
             if err:
@@ -229,7 +195,7 @@ Provide a clear, concise answer based only on the context provided.
                         "file": file_name,
                         "doc_id": doc_id,
                         "answer": item["answer"],
-                        "sources": item["sources"]  # single-page citation
+                        "sources": item["sources"]
                     })
 
         all_out.append({
@@ -243,17 +209,51 @@ Provide a clear, concise answer based only on the context provided.
 
 
 if __name__ == "__main__":
-    interactive_query()
+    # Mock questions for testing
+    mock_questions = [
+        "How many patients in the Lomustine treatment arm experienced periodontal disease?",
+        "What is the standard dosage and administration for alembic-telmisartan"
+    ]
+    
+    # Run the interactive query with mock questions
+    results = asyncio.run(interactive_query(mock_questions))
+    
+    # Print results
+    print("\n" + "="*80)
+    print("INTERACTIVE QUERY RESULTS")
+    print("="*80)
+    for result in results:
+        print(f"\nQuestion: {result['question']}")
+        print(f"Top Files: {result['top_files']}")
+        print(f"Number of Responses: {len(result['responses'])}")
+        for i, response in enumerate(result['responses'], 1):
+            print(f"\n  Response {i}:")
+            print(f"    File: {response['file']}")
+            print(f"    Doc ID: {response['doc_id']}")
+            if response.get('error'):
+                print(f"    Error: {response['error']}")
+            else:
+                print(f"    Answer: {response['answer']}")
+                print(f"    Sources: {len(response['sources'])} source(s)")
+    
+    print("\n" + "="*80)
 
 
 
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/")
 
-async def call_llm(prompt, model="gpt-4.1", temperature=0):
-    client = openai.AsyncOpenAI(api_key=OPENAI_API_KEY)
+# Initialize OpenAI-compatible client for Gemini
+client = AsyncOpenAI(
+    api_key=OPENAI_API_KEY,
+    base_url=OPENAI_BASE_URL
+)
+
+async def call_llm(prompt, model="gemini-2.0-flash", temperature=0):
     response = await client.chat.completions.create(
         model=model,
         messages=[{"role": "user", "content": prompt}],
         temperature=temperature
     )
-    return response.choices[0].message.content.strip()
+    return response.choices[0].message.content
