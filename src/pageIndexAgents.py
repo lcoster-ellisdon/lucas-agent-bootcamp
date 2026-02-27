@@ -66,7 +66,6 @@ async def interactive_query(
 
     # Debug: Print environment variables
     print("\n=== DEBUG: Environment Variables ===")
-    print(f"CLOUDFLARE_ACCOUNT_ID: {os.getenv('CLOUDFLARE_ACCOUNT_ID')}")
     print(f"EMBEDDING_API_KEY loaded: {'Yes' if os.getenv('EMBEDDING_API_KEY') else 'No'}")
     print(f"PAGEINDEX_API_KEY loaded: {'Yes' if os.getenv('PAGEINDEX_API_KEY') else 'No'}")
     print("===================================\n")
@@ -94,18 +93,18 @@ async def interactive_query(
                 doc_id=pi_doc_id
             )
            
-            sources = []
-            for node in results.get("result", []):
-                sources.append({
-                    "page": node.get("page_index"),
-                    "node_id": node.get("node_id"),
-                    "title": node.get("title"),
-                    "text": node.get("text", "")
-                })
+            # sources = []
+            # for node in results.get("result", []):
+            #     sources.append({
+            #         "page": node.get("page_index"),
+            #         "node_id": node.get("node_id"),
+            #         "title": node.get("title"),
+            #         "text": node.get("text", "")
+            #     })
+            # print(results)
 
-            sources.sort(key=lambda s: (s["page"] is None, s["page"]))
-            print(results["choices"][0]["message"]["content"])
-            return sources, None
+            # sources.sort(key=lambda s: (s["page"] is None, s["page"]))
+            return results["choices"][0]["message"]["content"], None
 
         except Exception as e:
             return [], str(e)
@@ -156,6 +155,7 @@ Provide a clear, concise answer based only on the context provided.
         # 2) PageIndex each top file
         responses = []
         for file_name in top_files:
+
             doc_id = filename_to_docid.get(file_name)
 
             if doc_id is None:
@@ -189,21 +189,17 @@ Provide a clear, concise answer based only on the context provided.
                     "sources": sources
                 })
             else:
-                node_answers = await _answer_per_source_node(q, sources, answers_per_doc)
-                for item in node_answers:
-                    responses.append({
-                        "file": file_name,
-                        "doc_id": doc_id,
-                        "answer": item["answer"],
-                        "sources": item["sources"]
-                    })
+                responses.append({
+                    "Question": q,
+                    "answer": sources,
+                })
 
         all_out.append({
-            "question": q,
-            "top_files": top_files,
-            "responses": responses
+            "question":q,
+            "answer": sources
+            
         })
-
+    
     return all_out
 
 
@@ -218,23 +214,10 @@ if __name__ == "__main__":
     # Run the interactive query with mock questions
     results = asyncio.run(interactive_query(mock_questions))
     
-    # Print results
-    print("\n" + "="*80)
-    print("INTERACTIVE QUERY RESULTS")
-    print("="*80)
-    for result in results:
-        print(f"\nQuestion: {result['question']}")
-        print(f"Top Files: {result['top_files']}")
-        print(f"Number of Responses: {len(result['responses'])}")
-        for i, response in enumerate(result['responses'], 1):
-            print(f"\n  Response {i}:")
-            print(f"    File: {response['file']}")
-            print(f"    Doc ID: {response['doc_id']}")
-            if response.get('error'):
-                print(f"    Error: {response['error']}")
-            else:
-                print(f"    Answer: {response['answer']}")
-                print(f"    Sources: {len(response['sources'])} source(s)")
+    for r in results:
+        print(f"Question: {r['question']}")
+        print(f"    Answer: {r['answer']}")
+    
     
     print("\n" + "="*80)
 
